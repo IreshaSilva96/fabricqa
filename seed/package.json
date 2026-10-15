@@ -1,0 +1,13 @@
+{
+  "name": "fabricqa-seed",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Seeds FabricQA master data (POs, batches, rolls). Simulates the D365 F&O -> Logic App sync.",
+  "main": "seed.js",
+  "scripts": {
+    "seed": "node seed.js"
+  },
+  "dependencies": {
+    "firebase-admin": "^13.0.0"
+  }
+}

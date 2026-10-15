@@ -1,0 +1,15 @@
+seed/serviceAccountKey*.json
+
+node_modules/
+.expo/
+# Secrets: never commit
+seed/serviceAccountKey.json
+mobile/.env.local
+*.env.local
+
+# Local editor and tool settings
+.vscode/
+.claude/
+
+# Training output not needed by the app
+*.keras

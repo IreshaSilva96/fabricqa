@@ -1,0 +1,119 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{db}/documents {
+
+    // ---------- helpers ----------
+    function signedIn() { return request.auth != null; }
+    function role() { return get(/databases/$(db)/documents/users/$(request.auth.uid)).data.role; }
+    function isInspector() { return signedIn() && role() == 'inspector'; }
+    function isSupervisor() { return signedIn() && role() == 'supervisor'; }
+    function plan(itemId) { return get(/databases/$(db)/documents/inspectionPlans/$(itemId)).data; }
+    function rollInsp(id) { return get(/databases/$(db)/documents/rollInspections/$(id)).data; }
+    function changedOnly(keys) { return request.resource.data.diff(resource.data).affectedKeys().hasOnly(keys); }
+
+    // ---------- users ----------
+    // Everyone reads their own profile; supervisors read all (to reassign rounds to inspectors)
+    match /users/{uid} {
+      allow read: if signedIn() && (request.auth.uid == uid || role() == 'supervisor');
+      allow write: if false;
+    }
+
+    // ---------- master data: written only by the D365 sync (seed script, Admin SDK) ----------
+    match /pos/{id}     { allow read: if signedIn(); allow write: if false; }
+    match /batches/{id} { allow read: if signedIn(); allow write: if false; }
+    match /items/{id}   { allow read: if signedIn(); allow write: if false; }
+    match /rolls/{id}   { allow read: if signedIn(); allow write: if false; }
+
+    // ---------- inspection plans (one per item) ----------
+    match /inspectionPlans/{itemId} {
+      allow read: if signedIn();
+
+      // Round 1: the inspector who starts the item becomes its owner
+      allow create: if isInspector()
+        && request.resource.data.itemId == itemId
+        && request.resource.data.assigneeId == request.auth.uid
+        && request.resource.data.status == 'in_progress'
+        && request.resource.data.currentRound == 1
+        && request.resource.data.currentRolls.size() >= 1;
+
+      // The owner ends the round: in progress -> waiting for the supervisor
+      allow update: if isInspector()
+        && resource.data.assigneeId == request.auth.uid
+        && resource.data.status == 'in_progress'
+        && request.resource.data.status == 'waiting'
+        && changedOnly(['status', 'rounds', 'updatedAt']);
+
+      // A supervisor decides a waiting item: escalate / 100% check / accept / reject
+      allow update: if isSupervisor()
+        && resource.data.status == 'waiting'
+        && request.resource.data.status in ['in_progress', 'accepted', 'rejected']
+        && changedOnly(['status', 'currentRound', 'currentRolls', 'inspectedRolls',
+                        'assigneeId', 'assigneeName', 'rounds', 'decision', 'updatedAt']);
+
+      allow delete: if false;
+    }
+
+    // ---------- roll inspections (one per roll per round) ----------
+    match /rollInspections/{id} {
+      allow read: if signedIn();
+
+      // Only the item's current owner, only for a roll in the current sample, one document per roll and round
+      allow create: if isInspector()
+        && id == request.resource.data.itemId + '_' + string(request.resource.data.round) + '_' + request.resource.data.rollNumber
+        && request.resource.data.inspectorId == request.auth.uid
+        && request.resource.data.status == 'in_progress'
+        && plan(request.resource.data.itemId).assigneeId == request.auth.uid
+        && plan(request.resource.data.itemId).status == 'in_progress'
+        && request.resource.data.round == plan(request.resource.data.itemId).currentRound
+        && request.resource.data.rollNumber in plan(request.resource.data.itemId).currentRolls;
+
+      // Ending the roll locks it: only once, only by its inspector, only the result fields
+      allow update: if isInspector()
+        && resource.data.inspectorId == request.auth.uid
+        && resource.data.status == 'in_progress'
+        && request.resource.data.status == 'ended'
+        && request.resource.data.result in ['pass', 'fail']
+        && changedOnly(['status', 'endedAt', 'defectCount', 'points', 'score', 'result']);
+
+      allow delete: if false;
+    }
+
+    // ---------- defects (small records; photos live separately) ----------
+    match /defects/{id} {
+      allow read: if signedIn();
+
+      allow create: if isInspector()
+        && request.resource.data.inspectorId == request.auth.uid
+        && rollInsp(request.resource.data.rollInspectionId).inspectorId == request.auth.uid
+        && rollInsp(request.resource.data.rollInspectionId).status == 'in_progress'
+        && request.resource.data.finalLabel in ['defect_free', 'hole', 'horizontal', 'stain', 'vertical']
+        // overridden must be true exactly when the inspector changed the AI's suggestion
+        && request.resource.data.overridden ==
+           (request.resource.data.aiLabel != null && request.resource.data.finalLabel != request.resource.data.aiLabel)
+        && request.resource.data.falseAlarm == (request.resource.data.finalLabel == 'defect_free')
+        // a real defect needs a position on the roll (0 to its length); a false alarm has none
+        && (request.resource.data.falseAlarm
+            ? request.resource.data.positionMeters == null
+            : (request.resource.data.positionMeters is number
+               && request.resource.data.positionMeters >= 0
+               && request.resource.data.positionMeters <= rollInsp(request.resource.data.rollInspectionId).lengthMeters));
+
+      // A defect captured by mistake can be deleted only while its roll is still in progress
+      allow delete: if isInspector()
+        && resource.data.inspectorId == request.auth.uid
+        && rollInsp(resource.data.rollInspectionId).status == 'in_progress';
+
+      allow update: if false;
+    }
+
+    match /defectPhotos/{id} {
+      allow read: if signedIn();
+      allow create: if isInspector()
+        && request.resource.data.inspectorId == request.auth.uid
+        && request.resource.data.photo is string
+        && request.resource.data.photo.size() < 150000;
+      allow delete: if isInspector() && resource.data.inspectorId == request.auth.uid;
+      allow update: if false;
+    }
+  }
+}
